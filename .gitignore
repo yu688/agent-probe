@@ -2,6 +2,7 @@ build/
 __pycache__/
 *.pyc
 .vscode/
+/.venv/
 ~$*.xlsx
 /firmware/esp32/sdkconfig
 /firmware/esp32/sdkconfig.old

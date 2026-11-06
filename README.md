@@ -8,7 +8,7 @@
 | --- | --- |
 | `firmware/rp2350/` | 独立 Pico SDK 工程，包含板级定义、PIO 程序和采集固件 |
 | `firmware/esp32/` | 独立 ESP-IDF 工程，固定目标为 ESP32-S3 |
-| `host/` | Python 协议和 Windows WinUSB 客户端 |
+| `host/` | Python 协议、共享设备会话、Windows WinUSB 客户端和 PyQt6 界面 |
 | `docs/`、`scripts/`、`tests/` | 项目文档、Windows 构建入口和回归测试 |
 | `build/rp2350/`、`build/esp32/` | 两套固件的本机构建输出 |
 
@@ -91,12 +91,27 @@ Windows 10/11的免驱目标由固件MS OS 2.0描述符实现。默认实验标�
 
 设备接口GUID：`{7C9B140E-5C85-4783-8B8A-F0BC97913546}`。默认不出现COM口。Windows按GUID枚举，USB序列号使用板载Flash唯一ID。
 
-Python需要3.11或更高版本，全部使用标准库：
+### PyQt6 上位机
+
+从项目根目录创建项目虚拟环境并安装 GUI 依赖。环境建好后，后续直接执行最后一行。
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r host/requirements-gui.txt
+.\.venv\Scripts\python.exe .\host\probe_gui.py
+```
+
+扫描并连接设备后可查看序列号、固件版本、系统时钟、能力位和 UART RX 引脚。串口测试针对通道 0（默认 GP5），支持设置波特率、开始和停止接收、UTF-8 文本或十六进制显示，并显示接收、丢弃、错误和积压计数。实时窗口仅保留最近的显示内容，完整原始日志可通过下方 CLI 的 `log` 命令保存。
+
+### CLI 与 Agent 调用
+
+CLI 使用 Python 3.11 或更高版本和标准库。Agent 可直接执行以下命令，解析标准输出中的 JSON，也可在项目根目录导入 `host.probe_client.Client`，传入已打开的 `host.winusb_transport.WinUSB`。同一设备请在 GUI 断开后交给 CLI 或 Agent，以保证同一时刻只有一个会话消费 USB 回包。
 
 ```powershell
 python .\host\probe_cli.py list
 python .\host\probe_cli.py info
 python .\host\probe_cli.py status
+python .\host\probe_cli.py uart-config --baud 100000
 python .\host\probe_cli.py log --seconds 30 --output uart.bin
 python .\host\probe_cli.py capture --rate 1000000 --samples 65536 --output capture.bin
 ```
