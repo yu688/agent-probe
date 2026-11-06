@@ -1,0 +1,7 @@
+build/
+__pycache__/
+*.pyc
+.vscode/
+~$*.xlsx
+/firmware/esp32/sdkconfig
+/firmware/esp32/sdkconfig.old

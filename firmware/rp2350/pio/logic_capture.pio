@@ -1,0 +1,10 @@
+.program logic_capture
+; 每个采样点使用两条指令，八个四位采样点自动组成一个32位字。
+pull block
+out y, 32
+sample_loop:
+in pins, 4
+jmp y-- sample_loop
+irq 0
+halt:
+jmp halt

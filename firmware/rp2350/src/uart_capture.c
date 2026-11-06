@@ -1,0 +1,145 @@
+#include "uart_capture.h"
+#include "agent_config.h"
+#include "hardware/uart.h"
+#include "hardware/irq.h"
+#include "hardware/sync.h"
+#include "hardware/regs/uart.h"
+#include "pico/stdlib.h"
+
+typedef struct
+{
+    uart_inst_t *uart;
+    uint pin;
+    uint irq;
+    bool enabled;
+    uint32_t baud;
+    volatile uint32_t head;
+    volatile uint32_t tail;
+    volatile uint32_t received;
+    volatile uint32_t dropped;
+    volatile uint32_t errors;
+    uint8_t data[AGENT_UART_RING_SIZE];
+} rx_port_t;
+
+static rx_port_t ports[2];
+_Static_assert((AGENT_UART_RING_SIZE & (AGENT_UART_RING_SIZE - 1u)) == 0, "环形缓冲长度必须为二次幂");
+
+static void drain_fifo(rx_port_t *port)
+{
+    while(uart_is_readable(port->uart))
+    {
+        uint32_t value = uart_get_hw(port->uart)->dr;
+        ++port->received;
+        if(value & (UART_UARTDR_OE_BITS | UART_UARTDR_BE_BITS |
+                    UART_UARTDR_PE_BITS | UART_UARTDR_FE_BITS))
+        {
+            ++port->errors;
+        }
+        if(port->head - port->tail >= AGENT_UART_RING_SIZE)
+        {
+            // 主机停止消费时丢弃新字节，累计计数明确报告缺口。
+            ++port->dropped;
+        }
+        else
+        {
+            port->data[port->head & (AGENT_UART_RING_SIZE - 1u)] = (uint8_t)value;
+            ++port->head;
+        }
+    }
+}
+
+static void uart_a_irq(void)
+{
+    drain_fifo(&ports[0]);
+}
+
+static void uart_b_irq(void)
+{
+    drain_fifo(&ports[1]);
+}
+
+bool uart_capture_configure(unsigned channel, bool enable, uint32_t baud)
+{
+    if(channel >= 2 || baud < 1200u || baud > 1000000u ||
+       (channel == 1 && !AGENT_ENABLE_UART_B))
+    {
+        return false;
+    }
+    rx_port_t *port = &ports[channel];
+    // 配置中断仅在本核执行；更改波特率前必须先关闭 RX 中断。
+    irq_set_enabled(port->irq, false);
+    if(port->enabled)
+    {
+        uart_set_irq_enables(port->uart, false, false);
+        uart_deinit(port->uart);
+    }
+    port->enabled = false;
+    if(enable)
+    {
+        port->baud = uart_init(port->uart, baud);
+        gpio_set_function(port->pin, GPIO_FUNC_UART);
+        gpio_disable_pulls(port->pin);
+        uart_set_hw_flow(port->uart, false, false);
+        uart_set_format(port->uart, 8, 1, UART_PARITY_NONE);
+        uart_set_fifo_enabled(port->uart, true);
+        port->enabled = true;
+        uart_set_irq_enables(port->uart, true, false);
+        irq_set_enabled(port->irq, true);
+    }
+    else
+    {
+        gpio_init(port->pin);
+        gpio_set_dir(port->pin, GPIO_IN);
+        gpio_disable_pulls(port->pin);
+    }
+    // 不初始化任何 UART TX 引脚，避免驱动被监听目标。
+    return true;
+}
+
+void uart_capture_init(void)
+{
+    ports[0].uart = uart1;
+    ports[0].pin = AGENT_UART_A_RX_PIN;
+    ports[0].irq = UART1_IRQ;
+    ports[1].uart = uart0;
+    ports[1].pin = AGENT_UART_B_RX_PIN;
+    ports[1].irq = UART0_IRQ;
+    irq_set_exclusive_handler(UART1_IRQ, uart_a_irq);
+    irq_set_exclusive_handler(UART0_IRQ, uart_b_irq);
+    uart_capture_configure(0, true, AGENT_UART_DEFAULT_BAUD);
+    if(AGENT_ENABLE_UART_B)
+    {
+        uart_capture_configure(1, true, AGENT_UART_DEFAULT_BAUD);
+    }
+}
+
+void uart_capture_stats(unsigned channel, uart_capture_stats_t *stats)
+{
+    rx_port_t *port = &ports[channel];
+    uint32_t state = save_and_disable_interrupts();
+    stats->enabled = port->enabled;
+    stats->baud = port->baud;
+    stats->received = port->received;
+    stats->dropped = port->dropped;
+    stats->errors = port->errors;
+    stats->buffered = port->head - port->tail;
+    restore_interrupts(state);
+}
+
+size_t uart_capture_read(unsigned channel, uint8_t *out, size_t capacity)
+{
+    rx_port_t *port = &ports[channel];
+    uint32_t state = save_and_disable_interrupts();
+    size_t count = port->head - port->tail;
+    if(count > capacity)
+    {
+        count = capacity;
+    }
+    for(size_t i = 0; i < count; ++i)
+    {
+        out[i] = port->data[port->tail & (AGENT_UART_RING_SIZE - 1u)];
+        ++port->tail;
+    }
+    restore_interrupts(state);
+    return count;
+}
