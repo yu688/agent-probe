@@ -5,12 +5,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// 按小端写入后，帧起始的四个字节是 ASCII "RPD1"。
 #define PROTO_MAGIC 0x31445052u
 #define PROTO_VERSION 1u
 #define PROTO_HEADER_SIZE 24u
 #define PROTO_MAX_PAYLOAD 1024u
 #define PROTO_MAX_FRAME (PROTO_HEADER_SIZE + PROTO_MAX_PAYLOAD)
 
+// 请求和事件类型与上位机的 host/protocol.py 对应。应答类型为请求类型 | 0x80。
 enum
 {
     CMD_INFO = 0x01,
@@ -24,6 +26,7 @@ enum
     EVENT_UART_DATA = 0x40
 };
 
+// 应答 payload 的前四字节是小端状态码，后面才是命令返回的数据。
 enum
 {
     STATUS_OK = 0,
@@ -33,14 +36,15 @@ enum
     STATUS_NOT_READY = 4
 };
 
+// 解析后的字段视图。线上布局由编解码函数逐字段处理。
 typedef struct
 {
     uint8_t type;
     uint8_t channel;
     uint8_t flags;
-    uint32_t request_id;
-    uint32_t sequence;
-    uint16_t length;
+    uint32_t request_id; // 应答回填请求编号，主动日志事件填 0。
+    uint32_t sequence;   // 设备发送帧的递增序号。
+    uint16_t length;     // payload 的字节数。
     const uint8_t *payload;
 } proto_frame_t;
 
@@ -51,6 +55,7 @@ typedef struct
     uint32_t bad_frames;
 } proto_parser_t;
 
+// frame 和它的 payload 仅在回调期间有效。
 typedef void (*proto_handler_t)(const proto_frame_t *frame, void *context);
 
 uint16_t proto_get_u16(const uint8_t *p);

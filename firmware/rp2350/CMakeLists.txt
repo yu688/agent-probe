@@ -17,6 +17,9 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 pico_sdk_init()
 
+add_library(lwrb STATIC third_party/lwrb/lwrb.c)
+target_include_directories(lwrb PUBLIC third_party/lwrb/include)
+
 set(AGENT_USB_VID "0xCAFE" CACHE STRING "实验用 USB VID")
 set(AGENT_USB_PID "0x40F0" CACHE STRING "实验用 USB PID")
 set(AGENT_UART_A_RX_PIN 5 CACHE STRING "通道0 UART1 RX")
@@ -29,6 +32,7 @@ add_executable(agent_probe
     src/usb_descriptors.c
     src/uart_capture.c
     src/logic_capture.c
+    src/esp_spi_buffers.c
 )
 target_include_directories(agent_probe PRIVATE include)
 target_compile_definitions(agent_probe PRIVATE
@@ -43,7 +47,7 @@ target_compile_options(agent_probe PRIVATE -Wall -Wextra -Werror -fstack-usage)
 pico_generate_pio_header(agent_probe "${CMAKE_CURRENT_LIST_DIR}/pio/logic_capture.pio")
 target_link_libraries(agent_probe PRIVATE
     pico_stdlib pico_unique_id hardware_uart hardware_irq hardware_sync
-    hardware_pio hardware_dma hardware_clocks tinyusb_device
+    hardware_pio hardware_dma hardware_clocks tinyusb_device lwrb
 )
 pico_enable_stdio_usb(agent_probe 0)
 pico_enable_stdio_uart(agent_probe 0)

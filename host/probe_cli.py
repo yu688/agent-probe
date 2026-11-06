@@ -20,6 +20,7 @@ class Client:
         self.on_event = on_event
 
     def request(self, kind, payload=b"", channel=0, timeout=3):
+        # 分配请求号后将整帧编码为字节，通过 WinUSB Bulk OUT 发送。
         self.request_id += 1
         request_id = self.request_id
         self.transport.write(encode(Frame(kind, channel=channel, request_id=request_id, payload=payload)))
@@ -27,12 +28,14 @@ class Client:
         while time.monotonic() < deadline:
             response = None
             for frame in self.parser.feed(self.transport.read()):
+                # Bulk IN 同时承载设备主动推送的日志和命令应答。
                 if frame.kind == UART_DATA:
                     if self.on_event:
                         self.on_event(frame)
                 elif frame.request_id == request_id and frame.kind == kind | 0x80:
                     if len(frame.payload) < 4:
                         raise RuntimeError("设备应答缺少状态码")
+                    # 先处理小端状态码，成功时只把后续业务数据交给调用方。
                     status = struct.unpack_from("<I", frame.payload)[0]
                     if status:
                         raise RuntimeError(f"设备拒绝命令：status={status}")

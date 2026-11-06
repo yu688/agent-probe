@@ -102,6 +102,7 @@ class WinUSB:
             raise
 
     def write(self, data):
+        # Bulk OUT 0x01 从主机到设备，data 已由上层编码。
         buffer = C.create_string_buffer(data)
         count = W.ULONG()
         _check(self.usb.WinUsb_WritePipe(self.interface, 0x01, buffer, len(data), C.byref(count), None))
@@ -109,6 +110,7 @@ class WinUSB:
             raise OSError("USB 写入不完整，需重新建立会话")
 
     def read(self):
+        # Bulk IN 0x81 从设备到主机，按实际读取长度返回一段字节流。
         buffer = C.create_string_buffer(4096)
         count = W.ULONG()
         if not self.usb.WinUsb_ReadPipe(self.interface, 0x81, buffer, len(buffer), C.byref(count), None):

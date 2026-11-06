@@ -6,6 +6,7 @@ import zlib
 MAGIC = b"RPD1"
 VERSION = 1
 MAX_PAYLOAD = 1024
+# 小端，固定 24 字节。依次为魔数、版本、类型、通道、标志、请求号、帧序号、长度、保留字段和 CRC。
 HEADER = struct.Struct("<4sBBBBIIHHI")
 INFO, STATUS, UART_CONFIG, LOG_STREAM = 1, 2, 3, 4
 CAPTURE_START, CAPTURE_STATUS, CAPTURE_READ, CAPTURE_CANCEL = range(0x10, 0x14)
@@ -14,6 +15,7 @@ UART_DATA = 0x40
 
 @dataclass(frozen=True)
 class Frame:
+    # request_id 用于匹配请求和应答，sequence 是设备发送帧的序号。
     kind: int
     channel: int = 0
     flags: int = 0
@@ -27,6 +29,7 @@ def encode(frame):
         raise ValueError("业务负载超过1024字节")
     header = HEADER.pack(MAGIC, VERSION, frame.kind, frame.channel, frame.flags,
                          frame.request_id, frame.sequence, len(frame.payload), 0, 0)
+    # 与固件一致，CRC 覆盖头部前 20 字节和 payload。
     crc = zlib.crc32(header[:20] + frame.payload)
     return header[:20] + struct.pack("<I", crc) + frame.payload
 
@@ -37,10 +40,12 @@ class Parser:
         self.bad_frames = 0
 
     def feed(self, data):
+        # 一次读取可能只有半帧，也可能包含多帧。未解析的尾部留待下次读取。
         self.buffer.extend(data)
         frames = []
         while len(self.buffer) >= 4:
             if self.buffer[:4] != MAGIC:
+                # 逐字节找回帧起点，避免跳过后续的有效帧。
                 del self.buffer[0]
                 continue
             if len(self.buffer) < HEADER.size:

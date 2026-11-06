@@ -7,21 +7,19 @@
 #include "protocol.h"
 #include "uart_capture.h"
 #include "logic_capture.h"
+#include "esp_spi_buffers.h"
+#include "lwrb/lwrb.h"
 
-#define RESPONSE_QUEUE_SIZE 4u
-
-typedef struct
-{
-    uint8_t data[PROTO_MAX_FRAME];
-    size_t length;
-    size_t sent;
-} tx_packet_t;
+#define USB_RX_RING_SIZE (2u * PROTO_MAX_FRAME)
+#define USB_TX_RING_SIZE (4u * PROTO_MAX_FRAME)
+#define USB_RX_BUDGET 64u
 
 static proto_parser_t parser;
-static tx_packet_t responses[RESPONSE_QUEUE_SIZE];
-static uint32_t response_head;
-static uint32_t response_tail;
-static tx_packet_t active_packet;
+static lwrb_t usb_rx;
+static lwrb_t usb_tx;
+static uint8_t usb_rx_data[USB_RX_RING_SIZE + 1u];
+static uint8_t usb_tx_data[USB_TX_RING_SIZE + 1u];
+static uint8_t tx_frame[PROTO_MAX_FRAME];
 static uint32_t tx_sequence;
 static bool log_stream;
 static bool was_mounted;
@@ -31,13 +29,14 @@ static uint64_t last_rx_us;
 
 static bool response_space(void)
 {
-    return response_head - response_tail < RESPONSE_QUEUE_SIZE;
+    return lwrb_get_free(&usb_tx) >= PROTO_MAX_FRAME;
 }
 
 static void reply(const proto_frame_t *request, uint32_t status, const uint8_t *data, size_t length)
 {
     // 命令在主循环串行处理，使用静态工作区，避免占满4KiB主栈。
     static uint8_t payload[PROTO_MAX_PAYLOAD];
+    // 应答沿用请求编号，payload 以四字节状态码开头。
     proto_put_u32(payload, status);
     if(length != 0)
     {
@@ -52,10 +51,9 @@ static void reply(const proto_frame_t *request, uint32_t status, const uint8_t *
         .length = (uint16_t)(length + 4),
         .payload = payload
     };
-    tx_packet_t *packet = &responses[response_head % RESPONSE_QUEUE_SIZE];
-    packet->length = proto_encode(packet->data, &frame);
-    packet->sent = 0;
-    ++response_head;
+    // 接收命令前已为一整帧预留空间，只有本主循环写入。
+    size_t encoded = proto_encode(tx_frame, &frame);
+    lwrb_write(&usb_tx, tx_frame, encoded);
 }
 
 static void encode_capture_info(uint8_t *out)
@@ -74,6 +72,7 @@ static void encode_capture_info(uint8_t *out)
 
 static void command_received(const proto_frame_t *request, void *context)
 {
+    // 流式解析器校验整帧后才调用这里，具体参数由各命令检查。
     (void)context;
     if(!response_space())
     {
@@ -258,6 +257,7 @@ static bool prepare_log_packet(void)
         }
         uart_capture_stats_t stats;
         uart_capture_stats(channel, &stats);
+        // 日志是设备主动发送的事件，前 24 字节是元数据，后面是原始 UART 字节。
         proto_put_u64(payload, now);
         proto_put_u32(payload + 8, stats.received);
         proto_put_u32(payload + 12, stats.dropped);
@@ -272,42 +272,66 @@ static bool prepare_log_packet(void)
             .length = (uint16_t)(24 + count),
             .payload = payload
         };
-        active_packet.length = proto_encode(active_packet.data, &frame);
-        active_packet.sent = 0;
+        size_t encoded = proto_encode(tx_frame, &frame);
+        lwrb_write(&usb_tx, tx_frame, encoded);
         last_log_us = now;
         return true;
     }
     return false;
 }
 
+static void receive_poll(void)
+{
+    // 空间不足时暂停读取，由 TinyUSB 和 USB 端点提供背压。
+    size_t count = lwrb_get_linear_block_write_length(&usb_rx);
+    if(count > USB_RX_BUDGET)
+    {
+        count = USB_RX_BUDGET;
+    }
+    if(count != 0 && tud_vendor_available())
+    {
+        void *data = lwrb_get_linear_block_write_address(&usb_rx);
+        lwrb_advance(&usb_rx, tud_vendor_read(data, count));
+    }
+
+    count = lwrb_get_linear_block_read_length(&usb_rx);
+    if(count > USB_RX_BUDGET)
+    {
+        count = USB_RX_BUDGET;
+    }
+    const uint8_t *data = lwrb_get_linear_block_read_address(&usb_rx);
+    size_t consumed = 0;
+    // 环形缓冲负责保存字节，解析器负责跨 USB 读取拼出完整业务帧。
+    while(consumed < count && response_space())
+    {
+        proto_feed(&parser, data[consumed++], command_received, NULL);
+    }
+    if(consumed != 0)
+    {
+        lwrb_skip(&usb_rx, consumed);
+        last_rx_us = time_us_64();
+    }
+}
+
 static void transmit_poll(void)
 {
-    if(active_packet.length == 0)
+    // 响应先入队，只有发完已排队的帧后才准备下一帧日志。
+    if(lwrb_get_full(&usb_tx) == 0 && !prepare_log_packet())
     {
-        if(response_head != response_tail)
-        {
-            active_packet = responses[response_tail % RESPONSE_QUEUE_SIZE];
-            ++response_tail;
-        }
-        else if(!prepare_log_packet())
-        {
-            return;
-        }
+        return;
     }
+
     size_t available = tud_vendor_write_available();
-    size_t count = active_packet.length - active_packet.sent;
+    size_t count = lwrb_get_linear_block_read_length(&usb_tx);
     if(count > available)
     {
         count = available;
     }
     if(count != 0)
     {
-        active_packet.sent += tud_vendor_write(active_packet.data + active_packet.sent, count);
+        const void *data = lwrb_get_linear_block_read_address(&usb_tx);
+        lwrb_skip(&usb_tx, tud_vendor_write(data, count));
         tud_vendor_write_flush();
-    }
-    if(active_packet.sent == active_packet.length)
-    {
-        active_packet.length = 0;
     }
 }
 
@@ -315,6 +339,9 @@ int main(void)
 {
     uart_capture_init();
     logic_capture_init();
+    esp_spi_buffers_init();
+    lwrb_init(&usb_rx, usb_rx_data, sizeof(usb_rx_data));
+    lwrb_init(&usb_tx, usb_tx_data, sizeof(usb_tx_data));
     tusb_init();
     while(true)
     {
@@ -329,8 +356,8 @@ int main(void)
                 logic_capture_cancel();
                 log_stream = false;
                 parser.used = 0;
-                response_head = response_tail = 0;
-                active_packet.length = 0;
+                lwrb_reset(&usb_rx);
+                lwrb_reset(&usb_tx);
             }
             was_mounted = false;
             continue;
@@ -342,17 +369,7 @@ int main(void)
             parser.used = 0;
             ++parser.bad_frames;
         }
-        // 每轮最多消费64字节，让USB发送和采集状态都能及时推进。
-        for(unsigned budget = 0; budget < 64 && response_space() && tud_vendor_available(); ++budget)
-        {
-            uint8_t byte;
-            if(tud_vendor_read(&byte, 1) != 1)
-            {
-                break;
-            }
-            last_rx_us = time_us_64();
-            proto_feed(&parser, byte, command_received, NULL);
-        }
+        receive_poll();
         transmit_poll();
     }
 }

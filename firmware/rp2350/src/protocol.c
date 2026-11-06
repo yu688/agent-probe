@@ -1,6 +1,7 @@
 #include "protocol.h"
 #include <string.h>
 
+// 多字节整数按小端逐字节读写，线上格式与 C 结构体对齐无关。
 uint16_t proto_get_u16(const uint8_t *p)
 {
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
@@ -54,6 +55,7 @@ size_t proto_encode(uint8_t *out, const proto_frame_t *frame)
     {
         return 0;
     }
+    // 帧头固定 24 字节。CRC 位于偏移 20，payload 从偏移 24 开始。
     proto_put_u32(out, PROTO_MAGIC);
     out[4] = PROTO_VERSION;
     out[5] = frame->type;
@@ -67,6 +69,7 @@ size_t proto_encode(uint8_t *out, const proto_frame_t *frame)
     {
         memcpy(out + PROTO_HEADER_SIZE, frame->payload, frame->length);
     }
+    // 头部和 payload 接续计算同一个 CRC，跳过 CRC 字段本身。
     uint32_t crc = proto_crc_update(0xFFFFFFFFu, out, 20);
     crc = proto_crc_update(crc, out + PROTO_HEADER_SIZE, frame->length);
     proto_put_u32(out + 20, crc ^ 0xFFFFFFFFu);
@@ -87,6 +90,7 @@ void proto_feed(proto_parser_t *parser, uint8_t byte, proto_handler_t handler, v
         ++parser->bad_frames;
     }
     parser->data[parser->used++] = byte;
+    // USB 读写边界可能落在帧中间。数据不足时保留已有字节，等待下次输入。
     while(parser->used >= 4)
     {
         if(proto_get_u32(parser->data) != PROTO_MAGIC)
@@ -115,6 +119,7 @@ void proto_feed(proto_parser_t *parser, uint8_t byte, proto_handler_t handler, v
         crc = proto_crc_update(crc, parser->data + PROTO_HEADER_SIZE, length);
         if((crc ^ 0xFFFFFFFFu) != proto_get_u32(parser->data + 20))
         {
+            // 当前帧候选无效，向后滑动一个字节，继续寻找下一处帧头。
             ++parser->bad_frames;
             discard_prefix(parser, 1);
             continue;
@@ -129,6 +134,7 @@ void proto_feed(proto_parser_t *parser, uint8_t byte, proto_handler_t handler, v
             .length = length,
             .payload = parser->data + PROTO_HEADER_SIZE
         };
+        // 回调先消费借用的 payload，随后移除已处理的帧。
         handler(&frame, context);
         discard_prefix(parser, total);
     }

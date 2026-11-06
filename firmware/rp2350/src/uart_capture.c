@@ -1,5 +1,6 @@
 #include "uart_capture.h"
 #include "agent_config.h"
+#include "lwrb/lwrb.h"
 #include "hardware/uart.h"
 #include "hardware/irq.h"
 #include "hardware/sync.h"
@@ -13,39 +14,35 @@ typedef struct
     uint irq;
     bool enabled;
     uint32_t baud;
-    volatile uint32_t head;
-    volatile uint32_t tail;
     volatile uint32_t received;
     volatile uint32_t dropped;
     volatile uint32_t errors;
-    uint8_t data[AGENT_UART_RING_SIZE];
+    lwrb_t rx;
+    uint8_t data[AGENT_UART_RING_SIZE + 1u];
 } rx_port_t;
 
 static rx_port_t ports[2];
-_Static_assert((AGENT_UART_RING_SIZE & (AGENT_UART_RING_SIZE - 1u)) == 0, "环形缓冲长度必须为二次幂");
 
 static void drain_fifo(rx_port_t *port)
 {
-    while(uart_is_readable(port->uart))
+    // 每次批量入队，满时仍要继续读取硬件 FIFO 和错误标志。
+    uint8_t batch[32];
+    do
     {
-        uint32_t value = uart_get_hw(port->uart)->dr;
-        ++port->received;
-        if(value & (UART_UARTDR_OE_BITS | UART_UARTDR_BE_BITS |
-                    UART_UARTDR_PE_BITS | UART_UARTDR_FE_BITS))
+        size_t count = 0;
+        while(count < sizeof(batch) && uart_is_readable(port->uart))
         {
-            ++port->errors;
+            uint32_t value = uart_get_hw(port->uart)->dr;
+            if(value & (UART_UARTDR_OE_BITS | UART_UARTDR_BE_BITS |
+                        UART_UARTDR_PE_BITS | UART_UARTDR_FE_BITS))
+            {
+                ++port->errors;
+            }
+            batch[count++] = (uint8_t)value;
         }
-        if(port->head - port->tail >= AGENT_UART_RING_SIZE)
-        {
-            // 主机停止消费时丢弃新字节，累计计数明确报告缺口。
-            ++port->dropped;
-        }
-        else
-        {
-            port->data[port->head & (AGENT_UART_RING_SIZE - 1u)] = (uint8_t)value;
-            ++port->head;
-        }
-    }
+        port->received += count;
+        port->dropped += count - lwrb_write(&port->rx, batch, count);
+    } while(uart_is_readable(port->uart));
 }
 
 static void uart_a_irq(void)
@@ -98,6 +95,10 @@ bool uart_capture_configure(unsigned channel, bool enable, uint32_t baud)
 
 void uart_capture_init(void)
 {
+    for(unsigned channel = 0; channel < 2; ++channel)
+    {
+        lwrb_init(&ports[channel].rx, ports[channel].data, sizeof(ports[channel].data));
+    }
     ports[0].uart = uart1;
     ports[0].pin = AGENT_UART_A_RX_PIN;
     ports[0].irq = UART1_IRQ;
@@ -122,7 +123,7 @@ void uart_capture_stats(unsigned channel, uart_capture_stats_t *stats)
     stats->received = port->received;
     stats->dropped = port->dropped;
     stats->errors = port->errors;
-    stats->buffered = port->head - port->tail;
+    stats->buffered = lwrb_get_full(&port->rx);
     restore_interrupts(state);
 }
 
@@ -130,16 +131,8 @@ size_t uart_capture_read(unsigned channel, uint8_t *out, size_t capacity)
 {
     rx_port_t *port = &ports[channel];
     uint32_t state = save_and_disable_interrupts();
-    size_t count = port->head - port->tail;
-    if(count > capacity)
-    {
-        count = capacity;
-    }
-    for(size_t i = 0; i < count; ++i)
-    {
-        out[i] = port->data[port->tail & (AGENT_UART_RING_SIZE - 1u)];
-        ++port->tail;
-    }
+    // UART 中断和消费端位于同一核，保留读操作的中断保护。
+    size_t count = lwrb_read(&port->rx, out, capacity);
     restore_interrupts(state);
     return count;
 }
