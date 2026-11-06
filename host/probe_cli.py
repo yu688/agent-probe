@@ -3,17 +3,16 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import struct
 import sys
 import time
 
 if __package__:
     from .probe_client import Client, decode_uart_event
-    from .protocol import decode_capture, CAPTURE_START, CAPTURE_STATUS, CAPTURE_READ, CAPTURE_CANCEL
+    from .logic_capture import CaptureSession, save_capture
     from .usb_transport import USB, list_devices
 else:
     from probe_client import Client, decode_uart_event
-    from protocol import decode_capture, CAPTURE_START, CAPTURE_STATUS, CAPTURE_READ, CAPTURE_CANCEL
+    from logic_capture import CaptureSession, save_capture
     from usb_transport import USB, list_devices
 
 
@@ -83,32 +82,18 @@ def main():
                 session["sha256"] = hashlib.file_digest(raw, "sha256").hexdigest()
             Path(str(args.output) + ".meta.json").write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
         elif args.command == "capture":
-            device_info = client.info()
-            current = decode_capture(client.request(CAPTURE_START, struct.pack("<II", args.rate, args.samples)))
-            deadline = time.monotonic() + args.samples / args.rate + 5
+            session = CaptureSession(client, args.rate, args.samples)
             try:
-                while current["state"] == 1 and time.monotonic() < deadline:
-                    time.sleep(0.02)
-                    current = decode_capture(client.request(CAPTURE_STATUS))
+                while session.result is None:
+                    session.step()
+                    if session.current["state"] == 1:
+                        time.sleep(0.02)
+                save_capture(session.result, args.output)
+                print(json.dumps(session.result.capture, indent=2))
             finally:
-                if current["state"] == 1:
-                    client.request(CAPTURE_CANCEL)
-            if current["state"] != 2:
-                raise RuntimeError(f"采集未成功：{current}")
-            with args.output.open("wb") as output:
-                for offset in range(0, current["bytes"], 1012):
-                    count = min(1012, current["bytes"] - offset)
-                    data = client.request(CAPTURE_READ, struct.pack("<III", current["capture_id"], offset, count))
-                    if len(data) != count + 8 or struct.unpack_from("<II", data) != (current["capture_id"], offset):
-                        raise RuntimeError("采集数据编号或偏移不匹配")
-                    output.write(data[8:])
-            record = {"device": device_info, "capture": current, "pins": [16, 17, 18, 19],
-                      "packing": "每字节低四位为较早样本，高四位为下一样本",
-                      "timestamp_kind": "CPU启动和完成标记，非精确采样沿"}
-            with args.output.open("rb") as raw:
-                record["sha256"] = hashlib.file_digest(raw, "sha256").hexdigest()
-            Path(str(args.output) + ".json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(json.dumps(current, indent=2))
+                if session.result is None and not session.cancelled:
+                    session.cancel()
+
 
 
 if __name__ == "__main__":

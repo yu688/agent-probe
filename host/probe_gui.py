@@ -1,20 +1,24 @@
-"""Agent Probe 的 USB 设备信息和串口接收测试界面。"""
+"""Agent Probe 的 USB、串口接收和四路逻辑采集界面。"""
 import codecs
 import sys
 import time
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QFontDatabase, QTextCursor
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFormLayout,
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout,
                              QGroupBox, QHBoxLayout, QLabel, QMainWindow,
-                             QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget)
+                             QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 if __package__:
     from .probe_client import Client, decode_uart_event
     from .usb_transport import USB, list_devices
+    from .logic_capture import CaptureSession, save_capture
+    from .logic_waveform import LogicWaveform
 else:
     from probe_client import Client, decode_uart_event
     from usb_transport import USB, list_devices
+    from logic_capture import CaptureSession, save_capture
+    from logic_waveform import LogicWaveform
 
 
 class DeviceWorker(QObject):
@@ -23,6 +27,9 @@ class DeviceWorker(QObject):
     status = pyqtSignal(dict)
     streaming = pyqtSignal(bool)
     log_bytes = pyqtSignal(bytes)
+    capturing = pyqtSignal(bool)
+    capture_progress = pyqtSignal(int, str)
+    capture_ready = pyqtSignal(object)
     failed = pyqtSignal(str)
     done = pyqtSignal()
     finished = pyqtSignal()
@@ -33,6 +40,7 @@ class DeviceWorker(QObject):
         self.active = False
         self.pending = bytearray()
         self.next_status = 0.0
+        self.capture_session = None
         self.timer = QTimer(self)
         self.timer.setInterval(20)
         self.timer.timeout.connect(self.poll)
@@ -54,9 +62,15 @@ class DeviceWorker(QObject):
                 self.set_stream(argument)
             elif action == "disconnect":
                 self.disconnect()
+            elif action == "capture":
+                self.capture_session = CaptureSession(self.client, *argument)
+                self.capturing.emit(True)
+                self.capture_progress.emit(0, "正在采集 GP16～GP19…")
+                self.timer.start()
+            elif action == "cancel_capture":
+                self.cancel_capture()
         except (OSError, RuntimeError, ValueError) as error:
-            self.disconnect(stop_stream=False)
-            self.failed.emit(str(error))
+            self.fail(error)
         finally:
             self.done.emit()
 
@@ -76,7 +90,8 @@ class DeviceWorker(QObject):
             self.next_status = time.monotonic() + 1
             self.timer.start()
         else:
-            self.timer.stop()
+            if self.capture_session is None:
+                self.timer.stop()
             self.status.emit(self.client.status())
 
     def collect(self, frame):
@@ -93,6 +108,20 @@ class DeviceWorker(QObject):
     def poll(self):
         # 唯一持有 USB 连接的线程在轮询、状态查询和按钮操作之间串行切换。
         try:
+            if self.capture_session is not None:
+                session = self.capture_session
+                result = session.step()
+                if result is not None:
+                    self.capture_session = None
+                    self.capture_ready.emit(result)
+                    self.capturing.emit(False)
+                    if not self.active:
+                        self.timer.stop()
+                elif session.current["state"] == 2:
+                    progress = len(session.data) * 100 // session.current["bytes"]
+                    self.capture_progress.emit(progress, f"读取数据 {len(session.data):,} / {session.current['bytes']:,} B")
+                self.flush_logs()
+                return
             if time.monotonic() >= self.next_status:
                 self.status.emit(self.client.status())
                 self.next_status = time.monotonic() + 1
@@ -100,22 +129,45 @@ class DeviceWorker(QObject):
                 self.client.poll_events()
             self.flush_logs()
         except (OSError, RuntimeError, ValueError) as error:
+            self.fail(error)
+
+    def fail(self, error):
+        try:
             self.disconnect(stop_stream=False)
-            self.failed.emit(str(error))
+        except (OSError, RuntimeError, ValueError):
+            pass  # USB 已断开时取消命令也可能失败，仍需报告原始错误。
+        self.failed.emit(str(error))
+
+    def cancel_capture(self):
+        session, self.capture_session = self.capture_session, None
+        try:
+            if session is not None:
+                session.cancel()
+        finally:
+            self.capturing.emit(False)
+            self.capture_progress.emit(0, "已取消，本次不保留部分数据")
+            if not self.active:
+                self.timer.stop()
 
     def disconnect(self, stop_stream=True):
         self.timer.stop()
         if self.client is not None:
             try:
+                if self.capture_session is not None:
+                    self.cancel_capture()
                 if self.active and stop_stream:
                     self.client.set_log_stream(False)
             finally:
                 self.flush_logs()
-                self.client.transport.close()
-                self.client = None
-                self.active = False
-                self.streaming.emit(False)
-                self.info.emit(None)
+                try:
+                    self.client.transport.close()
+                finally:
+                    self.client = None
+                    self.active = False
+                    self.capture_session = None
+                    self.capturing.emit(False)
+                    self.streaming.emit(False)
+                    self.info.emit(None)
 
     @pyqtSlot()
     def shutdown(self):
@@ -133,9 +185,12 @@ class ProbeWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Agent Probe · USB 与串口测试")
-        self.resize(820, 620)
+        self.setWindowTitle("Agent Probe · 串口与逻辑采集")
+        self.resize(1000, 780)
         self.connected = self.active = self.busy = self.closing = False
+        self.capturing = False
+        self.capture_supported = False
+        self.capture_result = None
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         central = QWidget()
@@ -183,7 +238,51 @@ class ProbeWindow(QMainWindow):
         self.log.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self.log.setPlaceholderText("开始接收后，目标串口日志会显示在这里。")
         uart_layout.addWidget(self.log, 1)
-        layout.addWidget(uart_group, 1)
+        tabs = QTabWidget()
+        tabs.addTab(uart_group, "串口日志")
+        logic = QWidget()
+        logic_layout = QVBoxLayout(logic)
+        hint = QLabel("GP16～GP19 · 四路输入 · 定长即时采集 · 与目标共地，输入电压需符合核心板 IO 规格")
+        hint.setWordWrap(True)
+        logic_layout.addWidget(hint)
+        row = QHBoxLayout()
+        self.capture_rate = QSpinBox()
+        self.capture_rate.setRange(2000, 25000000)
+        self.capture_rate.setValue(1000000)
+        self.capture_rate.setSuffix(" S/s")
+        self.capture_samples = QSpinBox()
+        self.capture_samples.setRange(8, 262144)
+        self.capture_samples.setSingleStep(8)
+        self.capture_samples.setValue(65536)
+        self.capture_button = QPushButton("开始采集")
+        self.cancel_capture_button = QPushButton("取消采集")
+        for widget in (QLabel("采样率"), self.capture_rate, QLabel("点数"), self.capture_samples,
+                       self.capture_button, self.cancel_capture_button):
+            row.addWidget(widget)
+        logic_layout.addLayout(row)
+        self.capture_message = QLabel("等待采集；点数必须为 8 的倍数。")
+        self.capture_message.setWordWrap(True)
+        logic_layout.addWidget(self.capture_message)
+        self.capture_progress = QProgressBar()
+        self.capture_progress.setValue(0)
+        logic_layout.addWidget(self.capture_progress)
+        self.waveform = LogicWaveform()
+        logic_layout.addWidget(self.waveform, 1)
+        view_row = QHBoxLayout()
+        self.view_start = QSpinBox()
+        self.view_start.setRange(0, 0)
+        self.view_count = QSpinBox()
+        self.view_count.setRange(1, 262144)
+        self.view_count.setValue(65536)
+        self.save_bin = QPushButton("保存 BIN + 元数据")
+        self.save_csv = QPushButton("导出 CSV")
+        for widget in (QLabel("起点"), self.view_start, QLabel("显示点数"), self.view_count,
+                       self.save_bin, self.save_csv):
+            view_row.addWidget(widget)
+        logic_layout.addLayout(view_row)
+        logic_layout.addWidget(QLabel("减小显示点数可放大波形；时间轴按实际平均采样率计算，概览保留高低电平包络。"))
+        tabs.addTab(logic, "逻辑 IO 采集")
+        layout.addWidget(tabs, 1)
 
         self.scan_button.clicked.connect(lambda: self.dispatch("scan"))
         self.connect_button.clicked.connect(self.toggle_connection)
@@ -192,6 +291,12 @@ class ProbeWindow(QMainWindow):
         self.stream_button.clicked.connect(self.toggle_stream)
         self.device_picker.currentIndexChanged.connect(self.update_controls)
         clear.clicked.connect(self.log.clear)
+        self.capture_button.clicked.connect(self.start_capture)
+        self.cancel_capture_button.clicked.connect(lambda: self.dispatch("cancel_capture"))
+        self.view_start.valueChanged.connect(self.update_waveform)
+        self.view_count.valueChanged.connect(self.update_waveform)
+        self.save_bin.clicked.connect(lambda: self.save_result(False))
+        self.save_csv.clicked.connect(lambda: self.save_result(True))
 
         self.thread = QThread(self)
         self.worker = DeviceWorker()
@@ -203,6 +308,9 @@ class ProbeWindow(QMainWindow):
         self.worker.status.connect(self.show_status)
         self.worker.streaming.connect(self.show_streaming)
         self.worker.log_bytes.connect(self.append_log)
+        self.worker.capturing.connect(self.show_capturing)
+        self.worker.capture_progress.connect(self.show_capture_progress)
+        self.worker.capture_ready.connect(self.show_capture)
         self.worker.failed.connect(self.show_error)
         self.worker.done.connect(self.complete_action)
         self.worker.finished.connect(self.thread.quit)
@@ -222,12 +330,19 @@ class ProbeWindow(QMainWindow):
         self.scan_button.setEnabled(ready and not self.connected)
         self.connect_button.setEnabled(ready and (self.connected or self.device_picker.currentIndex() >= 0))
         self.refresh_button.setEnabled(ready and self.connected)
-        self.baud.setEnabled(ready and self.connected and not self.active)
+        self.baud.setEnabled(ready and self.connected and not self.active and not self.capturing)
         self.configure_button.setEnabled(self.baud.isEnabled())
         self.hex_mode.setEnabled(ready and not self.active)
         self.stream_button.setEnabled(ready and self.connected)
         self.connect_button.setText("断开" if self.connected else "连接")
         self.stream_button.setText("停止接收" if self.active else "开始接收")
+        can_capture = ready and self.connected and self.capture_supported and not self.capturing
+        self.capture_button.setEnabled(can_capture)
+        self.capture_rate.setEnabled(can_capture)
+        self.capture_samples.setEnabled(can_capture)
+        self.cancel_capture_button.setEnabled(ready and self.capturing)
+        for button in (self.save_bin, self.save_csv):
+            button.setEnabled(ready and self.capture_result is not None and not self.capturing)
 
     def toggle_connection(self):
         if self.connected:
@@ -249,6 +364,10 @@ class ProbeWindow(QMainWindow):
 
     def show_info(self, info):
         self.connected = info is not None
+        self.capture_supported = bool(info and info["capabilities"] & 2)
+        if info:
+            self.capture_rate.setMaximum(info["max_rate"])
+            self.capture_samples.setMaximum(info["max_samples"])
         for key, label in self.info_labels.items():
             value = info[key] if self.connected else "—"
             if key == "capabilities" and self.connected:
@@ -298,6 +417,50 @@ class ProbeWindow(QMainWindow):
 
     def show_error(self, message):
         self.statusBar().showMessage(message)
+        self.capture_message.setText(message)
+
+    def start_capture(self):
+        if self.capture_samples.value() % 8:
+            self.capture_message.setText("点数必须是 8 的倍数，请调整后重试。")
+            return
+        self.dispatch("capture", (self.capture_rate.value(), self.capture_samples.value()))
+
+    def show_capturing(self, active):
+        self.capturing = active
+        self.update_controls()
+
+    def show_capture_progress(self, value, message):
+        self.capture_progress.setValue(value)
+        self.capture_message.setText(message)
+
+    def show_capture(self, result):
+        self.capture_result = result
+        c = result.capture
+        self.waveform.set_capture(result)
+        self.view_start.setRange(0, c["samples"] - 1)
+        self.view_start.setValue(0)
+        self.view_count.setMaximum(c["samples"])
+        self.view_count.setValue(c["samples"])
+        self.update_waveform()
+        self.show_capture_progress(100, f'采集 #{c["capture_id"]} 完成 · {c["samples"]:,} 点 · '
+                                   f'实际 {c["actual_rate"]:,} S/s · '
+                                   f'{c["samples"] / c["actual_rate"] * 1000:.3f} ms')
+
+    def update_waveform(self):
+        if self.capture_result is not None:
+            self.view_count.setMaximum(self.capture_result.capture["samples"] - self.view_start.value())
+            self.waveform.set_view(self.view_start.value(), self.view_count.value())
+
+    def save_result(self, as_csv):
+        suffix = "csv" if as_csv else "bin"
+        path, _ = QFileDialog.getSaveFileName(self, "保存逻辑采集", f"capture.{suffix}",
+                                            f"采集数据 (*.{suffix})")
+        if path:
+            try:
+                save_capture(self.capture_result, path, as_csv)
+                self.statusBar().showMessage(f"已保存：{path} 及 .json 元数据")
+            except OSError as error:
+                self.show_error(str(error))
 
     def closeEvent(self, event):
         if self.thread.isRunning():
