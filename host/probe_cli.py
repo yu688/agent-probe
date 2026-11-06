@@ -10,11 +10,11 @@ import time
 if __package__:
     from .probe_client import Client, decode_uart_event
     from .protocol import decode_capture, CAPTURE_START, CAPTURE_STATUS, CAPTURE_READ, CAPTURE_CANCEL
-    from .winusb_transport import WinUSB, list_devices
+    from .usb_transport import USB, list_devices
 else:
     from probe_client import Client, decode_uart_event
     from protocol import decode_capture, CAPTURE_START, CAPTURE_STATUS, CAPTURE_READ, CAPTURE_CANCEL
-    from winusb_transport import WinUSB, list_devices
+    from usb_transport import USB, list_devices
 
 
 def main():
@@ -46,8 +46,8 @@ def main():
         print(json.dumps(paths, ensure_ascii=False, indent=2))
         return
     if not 0 <= args.device < len(paths):
-        raise RuntimeError("未发现指定设备，请检查原生USB连接和WinUSB驱动绑定")
-    with WinUSB(paths[args.device]) as transport:
+        raise RuntimeError("未发现指定设备，请检查原生USB连接；Windows 需确认 WinUSB 驱动绑定")
+    with USB(paths[args.device]) as transport:
         client = Client(transport)
         if args.command == "info":
             print(json.dumps(client.info(), indent=2))

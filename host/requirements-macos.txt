@@ -1,0 +1,2 @@
+pyusb>=1.3,<2; sys_platform == "darwin"
+libusb-package>=1.0.26,<2; sys_platform == "darwin"

@@ -1,5 +1,6 @@
 """读取交叉编译后的 ELF 对象，验证实际生成的 USB 描述符字节。"""
 from pathlib import Path
+import os
 import struct
 import sys
 import unittest
@@ -28,9 +29,12 @@ def sections(path):
 class DescriptorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        path = ROOT / "build/rp2350/CMakeFiles/agent_probe.dir/src/usb_descriptors.c.obj"
+        build_dir = Path(os.environ.get("AGENT_RP2350_BUILD_DIR", ROOT / "build/rp2350"))
+        path = build_dir / "CMakeFiles/agent_probe.dir/src/usb_descriptors.c.obj"
         if not path.exists():
-            raise unittest.SkipTest("请先执行 scripts/build.ps1")
+            path = path.with_suffix(".o")
+        if not path.exists():
+            raise unittest.SkipTest("请先编译 RP2350；macOS 请设置 AGENT_RP2350_BUILD_DIR")
         cls.sections = sections(path)
 
     def test_ms_os_lengths_and_guid(self):

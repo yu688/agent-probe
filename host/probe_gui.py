@@ -11,10 +11,10 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFormLayout,
 
 if __package__:
     from .probe_client import Client, decode_uart_event
-    from .winusb_transport import WinUSB, list_devices
+    from .usb_transport import USB, list_devices
 else:
     from probe_client import Client, decode_uart_event
-    from winusb_transport import WinUSB, list_devices
+    from usb_transport import USB, list_devices
 
 
 class DeviceWorker(QObject):
@@ -43,7 +43,7 @@ class DeviceWorker(QObject):
             if action == "scan":
                 self.devices.emit(list_devices())
             elif action == "connect":
-                self.client = Client(WinUSB(argument), self.collect)
+                self.client = Client(USB(argument), self.collect)
                 self.refresh()
             elif action == "refresh":
                 self.refresh()
@@ -91,7 +91,7 @@ class DeviceWorker(QObject):
 
     @pyqtSlot()
     def poll(self):
-        # 唯一持有 WinUSB 连接的线程在轮询、状态查询和按钮操作之间串行切换。
+        # 唯一持有 USB 连接的线程在轮询、状态查询和按钮操作之间串行切换。
         try:
             if time.monotonic() >= self.next_status:
                 self.status.emit(self.client.status())
@@ -245,7 +245,7 @@ class ProbeWindow(QMainWindow):
         self.device_picker.clear()
         for index, path in enumerate(paths):
             self.device_picker.addItem(f"Agent Probe {index}", path)
-        self.statusBar().showMessage(f"发现 {len(paths)} 台设备" if paths else "未发现 WinUSB 设备")
+        self.statusBar().showMessage(f"发现 {len(paths)} 台设备" if paths else "未发现 Agent Probe USB 设备")
 
     def show_info(self, info):
         self.connected = info is not None

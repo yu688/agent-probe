@@ -1,6 +1,6 @@
 # RP2350 Agent 调试工具
 
-这是基于正点原子 RP2350A 核心板的 Agent 调试工具。RP2350 负责采集和 USB，ESP32-S3 是网络与后续显示的协处理器。RP2350 常规固件通过单个厂商自定义 USB 接口接入 Windows WinUSB。
+这是基于正点原子 RP2350A 核心板的 Agent 调试工具。RP2350 负责采集和 USB，ESP32-S3 是网络与后续显示的协处理器。RP2350 常规固件通过单个厂商自定义 USB 接口接入 Windows WinUSB 或 macOS libusb。
 
 ## 工程目录
 
@@ -8,9 +8,10 @@
 | --- | --- |
 | `firmware/rp2350/` | 独立 Pico SDK 工程，包含板级定义、PIO 程序和采集固件 |
 | `firmware/esp32/` | 独立 ESP-IDF 工程，固定目标为 ESP32-S3 |
-| `host/` | Python 协议、共享设备会话、Windows WinUSB 客户端和 PyQt6 界面 |
-| `docs/`、`scripts/`、`tests/` | 项目文档、Windows 构建入口和回归测试 |
+| `host/` | Python 协议、共享设备会话、Windows WinUSB / macOS libusb 客户端和 PyQt6 界面 |
+| `docs/`、`scripts/`、`tests/` | 项目文档、Windows / macOS 构建入口和回归测试 |
 | `build/rp2350/`、`build/esp32/` | 两套固件的本机构建输出 |
+| `build/macos/` | macOS 专用构建输出、ESP-IDF 依赖和本地配置（不提交） |
 
 ## 当前功能
 
@@ -24,7 +25,7 @@
 | 逻辑采集 | GP16~19四路，PIO + DMA，定长即时采集；每字节打包两个采样点 |
 | 采集容量 | 最多262144点，即128 KiB；单次点数必须是8的倍数 |
 | 请求采样率 | 2000~25000000 S/s；返回实际平均采样率，范围不是实板性能承诺 |
-| 电脑端 | 标准库Python CLI，直接调用Windows WinUSB，不依赖PyUSB或libusb |
+| 电脑端 | Windows 使用标准库 WinUSB；macOS 使用 PyUSB 和虚拟环境内的 libusb |
 | ESP32 SPI | RX 和 TX 各 2 KiB，已提供收发缓冲接口。GP20~23 保留给片间 SPI |
 
 ESP32-S3 工程启动后输出一条启动日志。RP2350 的 SPI 缓冲接口位于 `firmware/rp2350/include/esp_spi_buffers.h`，返回实际入队或出队的字节数。片间协议、引脚初始化、Wi-Fi 和屏幕属于后续实现。逻辑采集目前支持定长即时采集，Windows 客户端用于硬件通信验证。
@@ -48,12 +49,12 @@ ESP32-S3 工程启动后输出一条启动日志。RP2350 的 SPI 缓冲接口�
 
 产物 `agent_probe.uf2`、`agent_probe.elf` 和 `agent_probe.bin` 位于 `build/rp2350/`。可用 `-PicoRoot` 指定其他环境目录。跨目录构建时用绝对脚本路径。
 
-macOS 也可使用工程内的 `release` 预设。从仓库根目录运行以下命令，先将 Pico SDK 2.3.1（含子模块）、Arm GNU Toolchain、Ninja 和 CMake 3.21 或更新版本准备好，并将示例 SDK 路径替换为本机路径。将交叉编译器的 `bin` 加入 `PATH`，或在配置时传入 `-DPICO_TOOLCHAIN_PATH=工具链目录`。
+macOS 推荐使用下方的独立构建入口，将缓存与 Windows 分开。也可手动指定独立输出目录，先准备 Pico SDK 2.3.1（含子模块）、Arm GNU Toolchain、Ninja 和 CMake 3.21 或更新版本。将交叉编译器的 `bin` 加入 `PATH`，或在配置时传入 `-DPICO_TOOLCHAIN_PATH=工具链目录`。
 
 ```sh
-cd firmware/rp2350
-cmake --preset release -DPICO_SDK_PATH="/path/to/pico-sdk"
-cmake --build --preset release
+cmake -S firmware/rp2350 -B build/macos/rp2350 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH="/path/to/pico-sdk"
+cmake --build build/macos/rp2350 --parallel
 ```
 
 如果已有预编译的 pioasm 和 picotool，也可在配置时传入 `-Dpioasm_DIR=目录` 和 `-Dpicotool_DIR=目录`。
@@ -70,14 +71,46 @@ cmake --build --preset release
 
 ### ESP32-S3
 
-使用 ESP-IDF 6.1.0。Windows 可从桌面快捷方式 `IDF_v6.1_Powershell` 进入已激活的环境，本机 SDK 位于 `D:\esp\v6.1\esp-idf`。macOS 激活本机 ESP-IDF 6.1 环境后，执行相同命令。两端均从仓库根目录运行。 [Espressif 环境激活说明](https://docs.espressif.com/projects/idf-im-ui/en/latest/after_installing.html)
+使用 ESP-IDF 6.1.0。Windows 可从桌面快捷方式 `IDF_v6.1_Powershell` 进入已激活的环境，本机 SDK 位于 `D:\esp\v6.1\esp-idf`。以下命令从仓库根目录运行；macOS 使用下一节的独立构建入口。 [Espressif 环境激活说明](https://docs.espressif.com/projects/idf-im-ui/en/latest/after_installing.html)
 
 ```sh
 idf.py --version
 idf.py -C firmware/esp32 -B build/esp32 build
 ```
 
-应用镜像 `agent_esp32_coprocessor.bin`、引导程序、分区表和烧录参数均在 `build/esp32/`。启动验证使用 ESP-IDF 的默认 2 MB Flash 配置，PSRAM 留待选定模组后配置。两台机器通过源码同步，分别生成 CMake 缓存和本地 ESP-IDF 配置。上位机的设备通信使用 Windows WinUSB。
+应用镜像 `agent_esp32_coprocessor.bin`、引导程序、分区表和烧录参数均在 `build/esp32/`。启动验证使用 ESP-IDF 的默认 2 MB Flash 配置，PSRAM 留待选定模组后配置。两台机器通过源码同步，分别生成 CMake 缓存和本地 ESP-IDF 配置。
+
+### macOS 独立构建
+
+从仓库根目录执行，CMake 需在 `PATH` 中：
+
+```sh
+bash scripts/build-macos.sh rp2350
+```
+
+默认复用 `$HOME/.pico-sdk` 中的 SDK 2.3.1、Arm GNU Toolchain 15_2_Rel1、Ninja v1.13.2 和预编译 pioasm / picotool 2.3.1。可通过 `PICO_ROOT`、`SDK_VERSION`、`PICO_SDK_PATH`、`PICO_TOOLCHAIN_PATH`、`NINJA_BIN`、`CMAKE_BIN`、`PIOASM_DIR`、`PICOTOOL_DIR` 环境变量覆盖对应路径。启用第二路 UART 使用 `bash scripts/build-macos.sh rp2350 --enable-uart-b`；不带开关会恢复默认单路。
+
+ESP32-S3 首次构建前，安装项目内隔离的 ESP-IDF v6.1（版本号为 6.1.0）及工具，只需执行一次。以下命令不会覆盖 `$HOME/.espressif` 中已有的工具和 Python 环境：
+
+```sh
+git clone --branch v6.1 --depth 1 --shallow-submodules --recursive \
+  https://github.com/espressif/esp-idf.git build/macos/deps/esp-idf
+IDF_TOOLS_PATH="$PWD/build/macos/deps/espressif" \
+  bash build/macos/deps/esp-idf/install.sh esp32s3
+bash scripts/build-macos.sh esp32
+```
+
+准备好两套依赖后，执行 `bash scripts/build-macos.sh all` 可编译两套固件。ESP-IDF 在构建脚本的子 shell 中激活；也可同时指定 `IDF_PATH` 与 `IDF_TOOLS_PATH` 使用其他已安装的 v6.1 环境。
+
+macOS 产物分别位于 `build/macos/rp2350/agent_probe.{uf2,elf,bin}` 与 `build/macos/esp32/agent_esp32_coprocessor.bin`；ESP32 的 `sdkconfig` 也位于 `build/macos/esp32/`。整个 `build/` 已被 Git 忽略。Windows 的 `scripts/build.ps1`、`release` 预设及原有输出路径保持不变，不需要同步任何本机缓存或 SDK。
+
+验证 macOS 实际编译的 USB 描述符及协议：
+
+```sh
+AGENT_RP2350_BUILD_DIR=build/macos/rp2350 python3 -m unittest discover -s tests -v
+```
+
+此入口完成固件交叉编译；macOS 上位机使用方法见下方。
 
 ## 上板连接与使用
 
@@ -103,9 +136,28 @@ python -m venv .venv
 
 扫描并连接设备后可查看序列号、固件版本、系统时钟、能力位和 UART RX 引脚。串口测试针对通道 0（默认 GP5），支持设置波特率、开始和停止接收、UTF-8 文本或十六进制显示，并显示接收、丢弃、错误和积压计数。实时窗口仅保留最近的显示内容，完整原始日志可通过下方 CLI 的 `log` 命令保存。
 
+### macOS USB 与上位机
+
+常规固件枚举为 `RP2350 Agent Probe`（默认 `CAFE:40F0`），提供 `Agent Data` 厂商自定义 Bulk 接口，不会生成 `/dev/cu.*` 串口或磁盘。可以通过 `ioreg -p IOUSB -w 0` 查看系统是否已枚举设备。
+
+从项目根目录安装项目虚拟环境依赖并运行：
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r host/requirements-gui.txt
+.venv/bin/python host/probe_cli.py list
+.venv/bin/python host/probe_cli.py info
+.venv/bin/python host/probe_cli.py status
+.venv/bin/python host/probe_gui.py
+```
+
+仅使用 CLI 时，可改装 `host/requirements-macos.txt`。libusb 由 `libusb-package` 放在虚拟环境内，不需安装系统驱动。Windows 仍使用原有 WinUSB，依赖文件中的平台条件会跳过 macOS USB 包。
+
+macOS 按 VID/PID 枚举，通过 USB 总线与设备地址生成会话路径；重新插拔后请重新扫描。自定义固件 VID/PID 时，可设置 `AGENT_USB_VID` / `AGENT_USB_PID` 环境变量（例如 `0xCAFE` / `0x40F0`）。GUI 与 CLI 使用同一设备时，请先断开另一个会话。
+
 ### CLI 与 Agent 调用
 
-CLI 使用 Python 3.11 或更高版本和标准库。Agent 可直接执行以下命令，解析标准输出中的 JSON，也可在项目根目录导入 `host.probe_client.Client`，传入已打开的 `host.winusb_transport.WinUSB`。同一设备请在 GUI 断开后交给 CLI 或 Agent，以保证同一时刻只有一个会话消费 USB 回包。
+CLI 使用 Python 3.11 或更高版本；Windows 仅需标准库，macOS 需安装上述 USB 依赖。Agent 可直接执行以下命令，解析标准输出中的 JSON，也可在项目根目录导入 `host.probe_client.Client`，传入已打开的 `host.usb_transport.USB`。同一设备请在 GUI 断开后交给 CLI 或 Agent，以保证同一时刻只有一个会话消费 USB 回包。
 
 ```powershell
 python .\host\probe_cli.py list
@@ -139,6 +191,7 @@ python .\host\probe_cli.py capture --rate 1000000 --samples 65536 --output captu
 - 运行Python协议测试，覆盖拆包、粘包、CRC损坏、非法长度、应答与日志混合。
 - 从实际编译后的ELF对象读取USB描述符，检查WinUSB标识、UTF-16 GUID、BOS长度、接口和端点。
 - Windows设备枚举脚本可运行；当前未发现对应WinUSB设备。
+- macOS 使用 libusb 完成 RP2350 实板枚举、INFO 和 STATUS 请求，读取到固件 0.1.0、150 MHz 系统时钟及 UART 状态；包含 USB 故障处理与 Windows 传输层选择的 15 项回归测试通过。
 
 执行测试：
 

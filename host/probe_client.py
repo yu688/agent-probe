@@ -16,7 +16,7 @@ class Client:
         self.on_event = on_event
 
     def request(self, kind, payload=b"", channel=0, timeout=3):
-        # 分配请求号后将整帧编码为字节，通过 WinUSB Bulk OUT 发送。
+        # 分配请求号后将整帧编码为字节，通过 USB Bulk OUT 发送。
         self.request_id += 1
         request_id = self.request_id
         self.transport.write(encode(Frame(kind, channel=channel, request_id=request_id, payload=payload)))
